@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Response, status
@@ -9,6 +10,8 @@ from PIL import Image, ImageOps
 
 from ...appconfig import appconfig
 from ...container import container
+from ...services.processor.four_photo import FourPhotoJob, FourPhotoSettings
+from ...utils.exceptions import ProcessMachineOccupiedError
 from ...utils.media_resizer import resize
 
 logger = logging.getLogger(__name__)
@@ -72,3 +75,48 @@ def api_cmd_abort_get():
         # other errors
         logger.critical(exc)
         raise HTTPException(status_code=500, detail=f"something went wrong, Exception: {exc}") from exc
+
+
+@router.post("/four-photo/start")
+def api_start_four_photo(settings: FourPhotoSettings):
+    try:
+        container.processing_service.trigger_four_photo(settings)
+    except ProcessMachineOccupiedError as exc:
+        raise HTTPException(status_code=409, detail="Another session is already running") from exc
+    return "OK"
+
+
+def _four_photo_job() -> FourPhotoJob:
+    job = container.processing_service._workflow_jobmodel
+    if not isinstance(job, FourPhotoJob):
+        raise HTTPException(status_code=409, detail="No four-photo session is running")
+    return job
+
+
+@router.post("/four-photo/displayed/{capture_id}")
+def api_four_photo_displayed(capture_id: UUID):
+    if not _four_photo_job().control.displayed(capture_id):
+        raise HTTPException(status_code=409, detail="Capture is no longer awaiting display")
+    return "OK"
+
+
+@router.post("/four-photo/decision/{capture_id}/{decision}")
+def api_four_photo_decision(capture_id: UUID, decision: Literal["next", "reject"]):
+    if not _four_photo_job().control.decide(capture_id, decision):
+        raise HTTPException(status_code=409, detail="Capture is no longer awaiting a decision")
+    return "OK"
+
+
+@router.post("/four-photo/{command}")
+def api_four_photo_control(command: Literal["pause", "resume", "stop"]):
+    job = _four_photo_job()
+    getattr(job.control, command)()
+    return "OK"
+
+
+@router.get("/four-photo/draft/{session_id}")
+def api_four_photo_draft(session_id: UUID):
+    try:
+        return FileResponse(container.processing_service.get_four_photo_draft(session_id), media_type="image/jpeg")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Draft not found") from exc

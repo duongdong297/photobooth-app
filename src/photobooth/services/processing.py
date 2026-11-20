@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Mapping
+from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event as threadingEvent
 from threading import Thread
@@ -20,6 +21,7 @@ from .information import InformationService
 from .processor.animation import JobModelAnimation
 from .processor.base import JobModelBase
 from .processor.collage import JobModelCollage
+from .processor.four_photo import FourPhotoJob, FourPhotoSettings, FourPhotoStopped, make_four_photo_configuration
 from .processor.image import JobModelImage
 from .processor.machine.processingmachine import ProcessingMachine, userEvents
 from .processor.models import Capture
@@ -122,6 +124,7 @@ class ProcessingService(BaseService):
 
         # objects
         self._workflow_jobmodel: JobModelType | None = None
+        self._four_photo_drafts: dict[UUID, Path] = {}
         self._process_thread: Thread | None = None
 
         # external commands (next/reject/abort) can be sent from frontend api endpoints or gpio.
@@ -180,10 +183,22 @@ class ProcessingService(BaseService):
                 if current_state == ProcessingMachine.finished:
                     break
 
+                if isinstance(self._workflow_jobmodel, FourPhotoJob) and not self._workflow_jobmodel.control.wait_unpaused():
+                    self._workflow_jobmodel._status_sm.send("abort")
+                    continue
+
+                if current_state == ProcessingMachine.completed and isinstance(self._workflow_jobmodel, FourPhotoJob):
+                    self._four_photo_drafts[self._workflow_jobmodel._job_identifier] = self._workflow_jobmodel._draft_path
+
                 if current_state == ProcessingMachine.approval:
                     assert isinstance(self._workflow_jobmodel._configuration_set.jobcontrol, MultiImageJobControl)
 
-                    event = self._request_user_input(timeout=self._workflow_jobmodel._configuration_set.jobcontrol.approve_autoconfirm_timeout)
+                    if isinstance(self._workflow_jobmodel, FourPhotoJob):
+                        event = self._workflow_jobmodel.control.wait(
+                            self._workflow_jobmodel._configuration_set.jobcontrol.approve_autoconfirm_timeout
+                        )
+                    else:
+                        event = self._request_user_input(timeout=self._workflow_jobmodel._configuration_set.jobcontrol.approve_autoconfirm_timeout)
                     self._workflow_jobmodel._status_sm.send(event)
 
                 elif current_state == ProcessingMachine.capture and isinstance(self._workflow_jobmodel, JobModelVideo):
@@ -193,6 +208,8 @@ class ProcessingService(BaseService):
                 else:
                     self._workflow_jobmodel._status_sm.send("next")
 
+        except FourPhotoStopped:
+            sse_service.dispatch_event(SseEventProcessStateinfo(source=None, target=None, jobmodel=None))
         except Exception as exc:
             logger.error(f"the job failed, error: {exc}", exc_info=exc)
 
@@ -221,7 +238,15 @@ class ProcessingService(BaseService):
             acquisition_service=self._acquisition_service,
         )
 
-        logger.info(f"trigger {action_type=}, {action_index=}, starting job model: {jobmodel=}")
+        self._start_job(jobmodel, action_type)
+
+    def trigger_four_photo(self, settings: FourPhotoSettings):
+        self._check_occupied()
+        jobmodel = FourPhotoJob(make_four_photo_configuration(settings), self._acquisition_service)
+        self._start_job(jobmodel, "collage")
+
+    def _start_job(self, jobmodel, action_type):
+        logger.info(f"starting job model: {jobmodel=}")
         self._workflow_jobmodel = jobmodel
 
         # add listener to the job
@@ -234,6 +259,12 @@ class ProcessingService(BaseService):
         self._process_thread.start()
 
         self._information_service.stats_counter_increment(action_type)
+
+    def get_four_photo_draft(self, session_id: UUID) -> Path:
+        path = self._four_photo_drafts.get(session_id)
+        if path is None or not path.is_file():
+            raise FileNotFoundError("Four-photo draft not found")
+        return path
 
     def wait_until_job_finished(self):
         if self._process_thread is None:
